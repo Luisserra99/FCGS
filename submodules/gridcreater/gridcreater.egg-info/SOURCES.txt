@@ -1,0 +1,7 @@
+setup.py
+/d01/luis/FCGS/submodules/gridcreater/src/bindings.cpp
+/d01/luis/FCGS/submodules/gridcreater/src/gridcreater.cu
+gridcreater.egg-info/PKG-INFO
+gridcreater.egg-info/SOURCES.txt
+gridcreater.egg-info/dependency_links.txt
+gridcreater.egg-info/top_level.txt

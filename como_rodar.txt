@@ -1,0 +1,20 @@
+conda env create -f environment.yml
+
+------------------------------------------------------------------------
+
+conda activate FCGS
+
+--------------------------------------------------------------
+
+conda activate FCGS
+TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-11" pip install -e \
+  submodules/diff-gaussian-rasterization \
+  submodules/simple-knn \
+  submodules/freqencoder \
+  submodules/gridencoder \
+  submodules/gridcreater \
+  submodules/arithmetic
+
+---------------------------------------------------------------------------
+
+TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-11" pip install --no-build-isolation submodules/diff-gaussian-rasterization

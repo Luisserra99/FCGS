@@ -1,0 +1,4 @@
+# ninja log v7
+1	7106	1778683905218181489	/d01/luis/FCGS/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/simple_knn.o	836208c64e601854
+0	8681	1778683905218181489	/d01/luis/FCGS/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/ext.o	f9c812b8703cbeb4
+1	30281	1778683905218181489	/d01/luis/FCGS/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/spatial.o	b672fe981bb3920f
