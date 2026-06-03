@@ -13,7 +13,7 @@ def train(args):
 
     step_num = len(os.listdir(os.path.join(args.bit_path_from, str(args.lmd))))
     lmd = args.lmd
-    chunk_size_list = [200_0000, 100_0000, 100_0000]
+    chunk_size_list = [100_0000, 50_0000, 50_0000]
 
     CM = FCGS(
         Q=1,

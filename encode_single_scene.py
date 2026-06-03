@@ -1,4 +1,5 @@
 import time
+import json
 
 import torch
 from model.FCGS_model import FCGS
@@ -18,9 +19,9 @@ def train(args):
     g_xyz = gaussians._xyz.detach()
     N_gaussian = g_xyz.shape[0]
 
-    per_step_size = 100_0000
-    if N_gaussian > 100_0000 and N_gaussian < 110_0000:
-        per_step_size = 110_0000
+    per_step_size = 50_0000
+    if N_gaussian > 50_0000 and N_gaussian < 60_0000:
+        per_step_size = 60_0000
 
     _features_dc = gaussians._features_dc.detach().view(N_gaussian, -1)  # [N, 1, 3] -> [N, 3]
     _features_rest = gaussians._features_rest.detach().view(N_gaussian, -1)  # [N, 15, 3] -> [N, 45]
@@ -31,7 +32,7 @@ def train(args):
 
     step_num = int(np.ceil(N_gaussian / per_step_size))
     lmd = args.lmd
-    chunk_size_list = [200_0000, 100_0000, 100_0000]
+    chunk_size_list = [100_0000, 50_0000, 50_0000]
 
     CM = FCGS(
         Q=1,
@@ -57,6 +58,20 @@ def train(args):
     print(f"{args.ply_path_from} compressed! Save bitstreams to {args.bit_path_to}.")
     orig_size = os.path.getsize(args.ply_path_from)/1024/1024
     print(f"Original size: {orig_size:.4f} MB. Compressed size: {ttl_size:.4f} MB. Compression ratio: {orig_size/ttl_size:.4f} X")
+
+    # Save the metrics to a JSON file
+    metrics_path = os.path.join(args.bit_path_to, "compression_metrics.json")
+    metrics = {}
+    if os.path.exists(metrics_path):
+        with open(metrics_path, "r") as f:
+            metrics = json.load(f)
+    metrics[f"lmd_{lmd}"] = {
+        "orig_size": orig_size,
+        "compressed_size": ttl_size,
+        "compression_ratio": orig_size / ttl_size,
+    }
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=4)
 
 
 if __name__ == "__main__":

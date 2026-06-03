@@ -7,14 +7,29 @@ conda activate FCGS
 --------------------------------------------------------------
 
 conda activate FCGS
-TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-11" pip install -e \
-  submodules/diff-gaussian-rasterization \
-  submodules/simple-knn \
+
+pip install lpips
+pip install "numpy<2"
+
+TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-11" pip install --no-build-isolation submodules/simple-knn
+
+TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-11" pip install --no-build-isolation submodules/diff-gaussian-rasterization
+
+TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-11" pip install --no-build-isolation \
   submodules/freqencoder \
   submodules/gridencoder \
   submodules/gridcreater \
   submodules/arithmetic
 
----------------------------------------------------------------------------
+----------------------------------------------
+dar o clone do tmc3
+git clone https://github.com/MPEGGroup/mpeg-pcc-tmc13.git 2>&1
 
-TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-11" pip install --no-build-isolation submodules/diff-gaussian-rasterization
+fazer o build do tmc3
+cd /d01/luis/FCGS/mpeg-pcc-tmc13 && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release 2>&1
+
+build com todos os cores
+make -j20 2>&1
+
+no arquivo model/gpcc_utils.py mudar:
+        gpcc_codec_path='/d01/luis/FCGS/mpeg-pcc-tmc13/build/tmc3/tmc3'  # change tmc3 path

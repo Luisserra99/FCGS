@@ -1,4 +1,5 @@
 import time
+import json
 
 import torch
 import torch.nn as nn
@@ -58,7 +59,7 @@ def train(args):
 
     step_num = len(os.listdir(os.path.join(args.bit_path_from, str(args.lmd))))
     lmd = args.lmd
-    chunk_size_list = [200_0000, 100_0000, 100_0000]
+    chunk_size_list = [100_0000, 50_0000, 50_0000]
 
     CM = FCGS(
         Q=1,
@@ -114,6 +115,24 @@ def train(args):
         psnr_avg = psnr_test_sum / len(views)
 
         print(f"Evaluation results: psnr: {psnr_avg:.4f}, ssim: {ssim_avg:.4f}, lpips: {lpips_avg:.4f}, Ll1: {Ll1_avg:.4f}")
+
+        # Save the metrics to a JSON file
+        metrics_path = os.path.join(args.bit_path_from, "compression_metrics.json")
+        metrics = {}
+        if os.path.exists(metrics_path):
+            with open(metrics_path, "r") as f:
+                metrics = json.load(f)
+        key = f"lmd_{lmd}"
+        if key not in metrics:
+            metrics[key] = {}
+        metrics[key].update({
+            "PSNR": psnr_avg,
+            "SSIM": ssim_avg,
+            "LPIPS": lpips_avg,
+            "Ll1": Ll1_avg,
+        })
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=4)
 
 
 if __name__ == "__main__":
