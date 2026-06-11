@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 
@@ -489,5 +490,179 @@ def decoder(N_len, file_name='tmp.b', device='cuda'):
         int(output_cdf.shape[0]),
         int(output_cdf.shape[1])
     )
+    return sym_out
+
+
+MASK_PROB_CLAMP = 1e-6
+
+
+def _bernoulli_encode_bytes(sym, p1):
+    # sym: [M] int16 cuda; p1: [M] float32 cuda (clamped away from 0/1)
+    if sym.numel() == 0:
+        return b'', b''
+    p_u = 1 - p1.unsqueeze(-1)
+    p_0 = torch.zeros_like(p_u)
+    p_1 = torch.ones_like(p_u)
+    output_cdf = torch.cat([p_0, p_u, p_1], dim=-1)
+    (byte_stream_torch, cnt_torch) = arithmetic.arithmetic_encode(
+        sym,
+        output_cdf,
+        chunk_size_cuda,
+        int(output_cdf.shape[0]),
+        int(output_cdf.shape[1])
+    )
+    return cnt_torch.cpu().numpy().tobytes(), byte_stream_torch.cpu().numpy().tobytes()
+
+
+def _bernoulli_decode_bytes(p1, cnt_bytes, stream_bytes):
+    # p1: [M] float32 cuda; returns sym [M]
+    if p1.numel() == 0:
+        return torch.zeros(size=[0], dtype=torch.int16, device=p1.device)
+    cnt_torch = torch.tensor(np.frombuffer(cnt_bytes, dtype=np.int32).copy(), device="cuda")
+    byte_stream_torch = torch.tensor(np.frombuffer(stream_bytes, dtype=np.uint8).copy(), device="cuda")
+    p_u = 1 - p1.unsqueeze(-1)
+    p_0 = torch.zeros_like(p_u)
+    p_1 = torch.ones_like(p_u)
+    output_cdf = torch.cat([p_0, p_u, p_1], dim=-1)
+    sym_out = arithmetic.arithmetic_decode(
+        output_cdf,
+        byte_stream_torch,
+        cnt_torch,
+        chunk_size_cuda,
+        int(output_cdf.shape[0]),
+        int(output_cdf.shape[1])
+    )
+    return sym_out
+
+
+def _mask_ctx_ids(sym_A, M_B):
+    # context for odd-index elements from their two even-index neighbors:
+    # element at odd index 2j+1 has left neighbor sym_A[j], right neighbor sym_A[j+1]
+    left = sym_A[:M_B].to(torch.int64)
+    right = sym_A[1:M_B + 1].to(torch.int64)
+    if right.shape[0] < M_B:  # N even: last odd element has no right neighbor
+        right = torch.cat([right, left[-1:]], dim=0)
+    return left * 2 + right
+
+
+def _cond_bits(sym_t, ctx, n_ctx):
+    # theoretical bits to code sym_t given ctx ids, with per-context Bernoulli fit on the data
+    if sym_t.numel() == 0:
+        return 0.0
+    tot = torch.bincount(ctx, minlength=n_ctx).float()
+    ones = torch.bincount(ctx[sym_t.to(torch.bool)], minlength=n_ctx).float()
+    p = torch.where(tot > 0, ones / tot.clamp(min=1), torch.full_like(tot, 0.5))
+    p = torch.clamp(p, min=MASK_PROB_CLAMP, max=1 - MASK_PROB_CLAMP)
+    bits = -(ones * torch.log2(p) + (tot - ones) * torch.log2(1 - p)).sum()
+    return bits.item()
+
+
+MASK_CTX_MAX_LEVELS = 6
+
+
+def _mask_level_bits_estimate(sym_all, L):
+    # theoretical bits for the L-level dyadic scheme, incl. per-substream overhead
+    N = sym_all.shape[0]
+    m0 = 1 << (L - 1)
+    sym_0 = sym_all[0::m0]
+    bits = get_binary_vxl_size(sym_0.float())[1].item()
+    overhead = 64 + 32 * int(np.ceil(sym_0.shape[0] / chunk_size_cuda))
+    for k in range(1, L):
+        m_k = 1 << (L - 1 - k)
+        sym_k = sym_all[m_k::2 * m_k]
+        ctx = _mask_ctx_ids(sym_all[0::2 * m_k], sym_k.shape[0])
+        bits += _cond_bits(sym_k, ctx, 4) + 4 * 32
+        overhead += 64 + 32 * int(np.ceil(sym_k.shape[0] / chunk_size_cuda))
+    return bits + overhead
+
+
+def encoder_mask_ctx(x, file_name='mask_ctx.b'):
+    # x: [N] or [N, 1] binary mask in scan (Morton) order.
+    # Hierarchical dyadic context coding: level 0 = every 2^(L-1)-th bit with a global
+    # Bernoulli; level k refines the midpoints with a Bernoulli conditioned on the two
+    # already-coded neighbors at distance 2^(L-1-k) (4 contexts, probs fitted on the data
+    # and stored in the header). L is chosen at encode time from histogram estimates.
+    # Every level is one fully-parallel arithmetic_encode/decode pass.
+    assert file_name[-2:] == '.b'
+    sym_all = torch.floor(x.detach().view(-1)).to(torch.int16)
+    N = sym_all.shape[0]
+
+    L_max = 1
+    while L_max < MASK_CTX_MAX_LEVELS and (1 << L_max) <= N:
+        L_max += 1
+    L = min(range(1, L_max + 1), key=lambda l: _mask_level_bits_estimate(sym_all, l))
+
+    m0 = 1 << (L - 1)
+    level_syms = [sym_all[0::m0].contiguous()]
+    level_ctx = [None]
+    for k in range(1, L):
+        m_k = 1 << (L - 1 - k)
+        sym_k = sym_all[m_k::2 * m_k].contiguous()
+        level_syms.append(sym_k)
+        level_ctx.append(_mask_ctx_ids(sym_all[0::2 * m_k], sym_k.shape[0]))
+
+    p0 = np.float32(np.clip(level_syms[0].float().mean().item(), MASK_PROB_CLAMP, 1 - MASK_PROB_CLAMP))
+    p_ctx_all = np.zeros(shape=[max(L - 1, 0), 4], dtype=np.float32)
+    streams = []
+    # prob tensors are rebuilt from the stored float32 values so encode/decode CDFs match bit-exactly
+    p1_0 = torch.full(size=[level_syms[0].shape[0]], fill_value=float(p0), dtype=torch.float32, device=sym_all.device)
+    streams.append(_bernoulli_encode_bytes(level_syms[0], p1_0))
+    for k in range(1, L):
+        sym_k, ctx = level_syms[k], level_ctx[k]
+        tot = torch.bincount(ctx, minlength=4).float()
+        ones = torch.bincount(ctx[sym_k.to(torch.bool)], minlength=4).float()
+        p_ctx_t = torch.where(tot > 0, ones / tot.clamp(min=1), torch.full_like(tot, 0.5))
+        p_ctx = np.clip(p_ctx_t.cpu().numpy().astype(np.float32), MASK_PROB_CLAMP, 1 - MASK_PROB_CLAMP)
+        p_ctx_all[k - 1] = p_ctx
+        p1_k = torch.tensor(p_ctx, dtype=torch.float32, device=sym_all.device)[ctx]
+        streams.append(_bernoulli_encode_bytes(sym_k, p1_k))
+
+    with open(file_name, 'wb') as fout:
+        fout.write(np.array([1, L], dtype=np.uint8).tobytes())  # version, levels
+        fout.write(np.array([N], dtype=np.int32).tobytes())
+        fout.write(np.array([p0], dtype=np.float32).tobytes())
+        fout.write(p_ctx_all.tobytes())
+        for cnt_b, stream_b in streams:
+            fout.write(np.array([len(cnt_b)], dtype=np.int32).tobytes())
+            fout.write(cnt_b)
+            fout.write(np.array([len(stream_b)], dtype=np.int32).tobytes())
+            fout.write(stream_b)
+
+    bit_len = os.path.getsize(file_name) * 8
+    bits_global = get_binary_vxl_size(sym_all.float())[1].item()
+    print(f'mask_ctx: N={N}, levels={L}, achieved={bit_len}b, global-Bernoulli~{bits_global:.0f}b')
+    return bit_len
+
+
+def decoder_mask_ctx(N_len, file_name='mask_ctx.b', device='cuda'):
+    assert file_name[-2:] == '.b'
+    with open(file_name, 'rb') as fin:
+        version, L = np.frombuffer(fin.read(2), dtype=np.uint8)
+        assert version == 1, f'unsupported mask_ctx version: {version}'
+        L = int(L)
+        N = int(np.frombuffer(fin.read(4), dtype=np.int32)[0])
+        assert N == N_len, f'mask_ctx length mismatch: file {N} vs expected {N_len}'
+        p0 = np.frombuffer(fin.read(4), dtype=np.float32)[0]
+        p_ctx_all = np.frombuffer(fin.read(16 * max(L - 1, 0)), dtype=np.float32).copy().reshape(-1, 4)
+        chunks = []
+        for _ in range(L):
+            len_cnt = int(np.frombuffer(fin.read(4), dtype=np.int32)[0])
+            cnt_b = fin.read(len_cnt)
+            len_stream = int(np.frombuffer(fin.read(4), dtype=np.int32)[0])
+            chunks.append((cnt_b, fin.read(len_stream)))
+
+    sym_out = torch.zeros(size=[N], dtype=torch.int16, device=device)
+    m0 = 1 << (L - 1)
+    M_0 = len(range(0, N, m0))
+    p1_0 = torch.full(size=[M_0], fill_value=float(p0), dtype=torch.float32, device=device)
+    sym_0 = _bernoulli_decode_bytes(p1_0, *chunks[0])
+    sym_out[0::m0] = sym_0.to(torch.int16)
+    for k in range(1, L):
+        m_k = 1 << (L - 1 - k)
+        M_k = len(range(m_k, N, 2 * m_k))
+        ctx = _mask_ctx_ids(sym_out[0::2 * m_k], M_k)
+        p1_k = torch.tensor(p_ctx_all[k - 1], dtype=torch.float32, device=device)[ctx]
+        sym_k = _bernoulli_decode_bytes(p1_k, *chunks[k])
+        sym_out[m_k::2 * m_k] = sym_k.to(torch.int16)
     return sym_out
 

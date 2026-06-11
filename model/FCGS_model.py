@@ -12,6 +12,7 @@ from model.entropy_models import (Entropy_gaussian, Entropy_gaussian_mix_prob_3,
 from model.grid_utils import normalize_xyz, _grid_creater, _grid_encoder, FreqEncoder
 from model.gpcc_utils import sorted_voxels, sorted_orig_voxels, compress_gaussian_params, decompress_gaussian_params
 from model.encodings_cuda import (STE_multistep, encoder, decoder,
+                             encoder_mask_ctx, decoder_mask_ctx,
                              encoder_gaussian_mixed_chunk, decoder_gaussian_mixed_chunk,
                              encoder_factorized_chunk, decoder_factorized_chunk,
                              )
@@ -337,29 +338,40 @@ class FCGS(nn.Module):
         x_q = self.clamp(x_q, Q)
         return x_q
 
-    def compress(self, g_xyz, g_fea, means=None, stds=None, testing=True, root_path='./', chunk_size_list=(), determ_codec=False):
+    def compress(self, g_xyz, g_fea, means=None, stds=None, testing=True, root_path='./', chunk_size_list=(), determ_codec=False, mask_mode='ctx', xyz_bits=16):
         c_size_fea, c_size_feq, c_size_geo = chunk_size_list
-        g_xyz, g_fea = sorted_orig_voxels(g_xyz, g_fea)  # to morton order
+        g_xyz, g_fea = sorted_orig_voxels(g_xyz, g_fea, scale_factor=xyz_bits)  # to morton order
+        # mask is computed in scan (Morton) order; Encoder_mask is per-row, so values are order-independent
+        mask_sig = self.Encoder_mask(g_fea)  # [N_g, 1]
+        mask = ((mask_sig > 0.01).float() - mask_sig).detach() + mask_sig  # [N_g, 1]
+        if mask_mode == 'ctx':
+            # spatial-context coding exploits Morton-order correlation, so it must happen pre-shuffle
+            bits_mask = encoder_mask_ctx(
+                x=mask,
+                file_name=os.path.join(root_path, 'mask_ctx.b')
+            )
         # doing compression
         print('Start compressing xyz...')
         bits_xyz = compress_gaussian_params(
             gaussian_params=g_xyz,
-            bin_path=os.path.join(root_path, 'xyz_gpcc.bin')
+            bin_path=os.path.join(root_path, 'xyz_gpcc.bin'),
+            xyz_bits=xyz_bits,
         )[-1]['file_size']['total'] * 8 * 1024 * 1024
+        # the mask coding above must stay free of torch RNG ops so this randperm is unchanged
         torch.manual_seed(1)
         shuffled_indices = torch.randperm(g_xyz.size(0))
         g_xyz = g_xyz[shuffled_indices]  # [N_g, 3]
         g_fea = g_fea[shuffled_indices]  # [N_g, 56]
+        mask = mask[shuffled_indices]  # [N_g, 1]
         fe, op, sc, ro = torch.split(g_fea, split_size_or_sections=[3 + 45, 1, 3, 4], dim=-1)  # [N_g, x] for each
         norm_xyz, norm_xyz_clamp, mask_xyz = normalize_xyz(g_xyz, K=self.norm_radius, means=means, stds=stds)   # [N_g, 3]
         freq_enc_xyz = self.freq_enc(norm_xyz_clamp)  # [N_g, freq_output]
         N_g = g_xyz.shape[0]  # N_g
-        mask_sig = self.Encoder_mask(g_fea)  # [N_g, 1]
-        mask = ((mask_sig > 0.01).float() - mask_sig).detach() + mask_sig  # [N_g, 1]
-        bits_mask = encoder(
-            x=mask,
-            file_name=os.path.join(root_path, 'mask.b')
-        )
+        if mask_mode != 'ctx':
+            bits_mask = encoder(
+                x=mask,
+                file_name=os.path.join(root_path, 'mask.b')
+            )
         mask_fea = mask.detach()[:, 0].to(torch.bool)  # [N_g]
         mask_feq = torch.logical_not(mask_fea)  # [N_g]
 
@@ -616,16 +628,27 @@ class FCGS(nn.Module):
         g_xyz = decompress_gaussian_params(
             bin_path=os.path.join(root_path, 'xyz_gpcc.bin'),
         )[0]  # [N_g, 3]
+        mask_ctx_path = os.path.join(root_path, 'mask_ctx.b')
+        use_mask_ctx = os.path.exists(mask_ctx_path)
+        if use_mask_ctx:
+            # context-coded mask is stored in scan (Morton) order: decode pre-shuffle, no torch RNG ops here
+            mask = decoder_mask_ctx(
+                N_len=g_xyz.shape[0],
+                file_name=mask_ctx_path
+            ).view(g_xyz.shape[0], 1)  # [N_g, 1]
         torch.manual_seed(1)
         shuffled_indices = torch.randperm(g_xyz.size(0))
         g_xyz = g_xyz[shuffled_indices]  # [N_g, 3]
+        if use_mask_ctx:
+            mask = mask[shuffled_indices]  # [N_g, 1]
         norm_xyz, norm_xyz_clamp, mask_xyz = normalize_xyz(g_xyz, K=self.norm_radius, means=means, stds=stds)   # [N_g, 3]
         freq_enc_xyz = self.freq_enc(norm_xyz_clamp)  # [N_g, freq_output]
         N_g = g_xyz.shape[0]
-        mask = decoder(
-            N_len=N_g,
-            file_name=os.path.join(root_path, 'mask.b')
-        ).view(N_g, 1)  # [N_g, 1]
+        if not use_mask_ctx:
+            mask = decoder(
+                N_len=N_g,
+                file_name=os.path.join(root_path, 'mask.b')
+            ).view(N_g, 1)  # [N_g, 1]
         mask_fea = mask.detach()[:, 0].to(torch.bool)  # [N_g]
         mask_feq = torch.logical_not(mask_fea)  # [N_g]
 

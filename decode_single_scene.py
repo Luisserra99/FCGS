@@ -11,8 +11,18 @@ from typing import NamedTuple
 
 def train(args):
 
-    step_num = len(os.listdir(os.path.join(args.bit_path_from, str(args.lmd))))
     lmd = args.lmd
+    bit_path_from = args.bit_path_from
+    container = os.path.join(bit_path_from, f'{lmd}.fcgs')
+    tmp_dir = None
+    if os.path.exists(container):
+        import tempfile
+        from tools.fcgs_container import unpack as fcgs_unpack
+        tmp_dir = tempfile.TemporaryDirectory()
+        fcgs_unpack(container, os.path.join(tmp_dir.name, str(lmd)))
+        bit_path_from = tmp_dir.name
+
+    step_num = len(os.listdir(os.path.join(bit_path_from, str(args.lmd))))
     chunk_size_list = [200_0000, 100_0000, 100_0000]
 
     CM = FCGS(
@@ -28,10 +38,12 @@ def train(args):
     CM.eval()
     with torch.no_grad():
         for s in range(step_num):
-            bit_save_path = os.path.join(args.bit_path_from, f"{lmd}/{s}")
+            bit_save_path = os.path.join(bit_path_from, f"{lmd}/{s}")
             g_xyz_out, g_fea_out = CM.decomprss(root_path=bit_save_path, chunk_size_list=chunk_size_list)
             g_xyz_list.append(g_xyz_out)
             g_fea_list.append(g_fea_out)
+    if tmp_dir is not None:
+        tmp_dir.cleanup()
             
     g_xyz = torch.cat(g_xyz_list, dim=0)
     g_fea = torch.cat(g_fea_list, dim=0)

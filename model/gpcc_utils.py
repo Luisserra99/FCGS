@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 from tempfile import TemporaryDirectory
 from typing import Union
@@ -10,14 +11,31 @@ import torch
 VOXELIZE_SCALE_FACTOR = 16
 CHUNK_SIZE = 32768
 
-def gpcc_encode(encoder_path: str, ply_path: str, bin_path: str) -> None:
+GPCC_CODEC_PATH = (
+    os.environ.get('TMC3_PATH')
+    or shutil.which('tmc3')
+    or os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'mpeg-pcc-tmc13', 'build', 'tmc3', 'tmc3'))
+)
+
+# cabac_bypass=0 measured ~0.6% smaller than the original =1 at identical speed (tools/gpcc_sweep.py);
+# planar/intra6 were neutral and predictive geometry 18-30% worse on 3DGS clouds
+GPCC_ENC_FLAGS_DEFAULT = (
+    '--trisoupNodeSizeLog2=0 --mergeDuplicatedPoints=0 --neighbourAvailBoundaryLog2=8 '
+    '--intra_pred_max_node_size_log2=3 --positionQuantizationScale=1 --inferredDirectCodingMode=3 '
+    '--maxNumQtBtBeforeOt=2 --minQtbtSizeLog2=0 --planarEnabled=0 --planarModeIdcmUse=0 '
+    '--cabac_bypass_stream_enabled_flag=0'
+)
+
+XYZ_BIN_MAGIC = b'FCGSXYZ1'
+
+def gpcc_encode(encoder_path: str, ply_path: str, bin_path: str, flags: str = None) -> None:
     """
     Compress geometry point cloud by GPCC codec.
     """
+    if flags is None:
+        flags = GPCC_ENC_FLAGS_DEFAULT
     enc_cmd = (f'{encoder_path} '
-               f'--mode=0 --trisoupNodeSizeLog2=0 --mergeDuplicatedPoints=0 --neighbourAvailBoundaryLog2=8 '
-               f'--intra_pred_max_node_size_log2=3 --positionQuantizationScale=1 --inferredDirectCodingMode=3 '
-               f'--maxNumQtBtBeforeOt=2 --minQtbtSizeLog2=0 --planarEnabled=0 --planarModeIdcmUse=0 --cabac_bypass_stream_enabled_flag=1 '
+               f'--mode=0 {flags} '
                f'--uncompressedDataPath={ply_path} --compressedStreamPath={bin_path} ')
     enc_cmd += '> nul 2>&1' if os.name == 'nt' else '> /dev/null 2>&1'
     exit_code = os.system(enc_cmd)
@@ -63,23 +81,24 @@ def read_ply_geo_bin(ply_path: str) -> np.ndarray:
     return means
 
 
-def voxelize(means: np.ndarray) -> tuple:
+def voxelize(means: np.ndarray, scale_factor: int = VOXELIZE_SCALE_FACTOR) -> tuple:
     """
     Voxelization of Gaussians.
     """
     # voxelize means
     means_min, means_max = means.min(axis=0), means.max(axis=0)
     voxelized_means = (means - means_min) / (means_max - means_min)  # normalize to [0, 1]
-    voxelized_means = np.round(voxelized_means * (2 ** VOXELIZE_SCALE_FACTOR - 1))
+    voxelized_means = np.round(voxelized_means * (2 ** scale_factor - 1))
 
     return voxelized_means, means_min, means_max
 
 
-def devoxelize(voxelized_means: np.ndarray, means_min: np.ndarray, means_max: np.ndarray) -> np.ndarray:
+def devoxelize(voxelized_means: np.ndarray, means_min: np.ndarray, means_max: np.ndarray,
+               scale_factor: int = VOXELIZE_SCALE_FACTOR) -> np.ndarray:
     voxelized_means = voxelized_means.astype(np.float32)
     means_min = means_min.astype(np.float32)
     means_max = means_max.astype(np.float32)
-    means = voxelized_means / (2 ** VOXELIZE_SCALE_FACTOR - 1) * (means_max - means_min) + means_min
+    means = voxelized_means / (2 ** scale_factor - 1) * (means_max - means_min) + means_min
     return means
 
 def dec_enc_voxelize(means, means_min=None, means_max=None):
@@ -122,11 +141,11 @@ def sorted_voxels(voxelized_means: np.ndarray, other_params = None) -> Union[np.
     return voxelized_means, other_params
 
 
-def sorted_orig_voxels(means, other_params=None):
+def sorted_orig_voxels(means, other_params=None, scale_factor: int = VOXELIZE_SCALE_FACTOR):
     means = means.detach().cpu().numpy().astype(np.float32)
-    voxelized_means, means_min, means_max = voxelize(means=means)
+    voxelized_means, means_min, means_max = voxelize(means=means, scale_factor=scale_factor)
     voxelized_means, other_params = sorted_voxels(voxelized_means=voxelized_means, other_params=other_params)
-    means = devoxelize(voxelized_means=voxelized_means, means_min=means_min, means_max=means_max)
+    means = devoxelize(voxelized_means=voxelized_means, means_min=means_min, means_max=means_max, scale_factor=scale_factor)
     means = torch.from_numpy(means).cuda().to(torch.float32)
     return means, other_params
 
@@ -153,7 +172,9 @@ def read_binary_data(dst_bin_path: str, src_file_handle) -> None:
 def compress_gaussian_params(
         gaussian_params,
         bin_path,
-        gpcc_codec_path='tmc3'  # change tmc3 path
+        gpcc_codec_path=GPCC_CODEC_PATH,
+        gpcc_flags=None,
+        xyz_bits=VOXELIZE_SCALE_FACTOR,
 ):
     """
     Compress Gaussian model parameters.
@@ -164,7 +185,7 @@ def compress_gaussian_params(
         gaussian_params = gaussian_params.detach().cpu().numpy()
     means = gaussian_params
     # voxelization
-    voxelized_means, means_min, means_max = voxelize(means=means)
+    voxelized_means, means_min, means_max = voxelize(means=means, scale_factor=xyz_bits)
     # sort voxels
     voxelized_means = sorted_voxels(voxelized_means=voxelized_means, other_params=None)
     means_enc = None
@@ -176,10 +197,15 @@ def compress_gaussian_params(
         write_ply_geo_ascii(geo_data=voxelized_means, ply_path=ply_path)
 
         means_bin_path = os.path.join(temp_dir, 'compressed.bin')
-        gpcc_encode(encoder_path=gpcc_codec_path, ply_path=ply_path, bin_path=means_bin_path)
+        gpcc_encode(encoder_path=gpcc_codec_path, ply_path=ply_path, bin_path=means_bin_path, flags=gpcc_flags)
 
         # write head info and merge all compressed data into binary file
         with open(bin_path, 'wb') as f:
+            # 16-bit streams keep the legacy headerless format so older decoders still read them;
+            # other depths get a magic + bit-depth prefix
+            if xyz_bits != VOXELIZE_SCALE_FACTOR:
+                f.write(XYZ_BIN_MAGIC)
+                f.write(np.array([xyz_bits], dtype=np.uint8).tobytes())
             # write head info
             head_info = np.array([means_min, means_max], dtype=np.float32)
             f.write(head_info.tobytes())  # 2 * 3 * 4 = 24 bytes
@@ -201,7 +227,7 @@ def compress_gaussian_params(
 
 def decompress_gaussian_params(
         bin_path,
-        gpcc_codec_path='tmc3'  # change tmc3 path
+        gpcc_codec_path=GPCC_CODEC_PATH,
 ):
     """
     Decompress Gaussian model parameters.
@@ -211,6 +237,12 @@ def decompress_gaussian_params(
     with TemporaryDirectory() as temp_dir:
         # read head info
         with open(bin_path, 'rb') as f:
+            xyz_bits = VOXELIZE_SCALE_FACTOR
+            prefix = f.read(len(XYZ_BIN_MAGIC))
+            if prefix == XYZ_BIN_MAGIC:
+                xyz_bits = int(np.frombuffer(f.read(1), dtype=np.uint8)[0])
+            else:
+                f.seek(0)  # legacy headerless 16-bit format
             head_info = np.frombuffer(f.read(24), dtype=np.float32)
             means_min, means_max = head_info[:3], head_info[3:]
 
@@ -225,7 +257,7 @@ def decompress_gaussian_params(
         voxelized_means = sorted_voxels(voxelized_means)  # decoded voxelized means are unsorted, thus need sorting
 
         # devoxelize means
-        means_dec = devoxelize(voxelized_means=voxelized_means, means_min=means_min, means_max=means_max)
+        means_dec = devoxelize(voxelized_means=voxelized_means, means_min=means_min, means_max=means_max, scale_factor=xyz_bits)
         means_dec = torch.from_numpy(means_dec).cuda()
 
     return means_dec, voxelized_means, means_min, means_max
