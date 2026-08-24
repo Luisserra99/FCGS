@@ -337,7 +337,7 @@ class FCGS(nn.Module):
         x_q = self.clamp(x_q, Q)
         return x_q
 
-    def compress(self, g_xyz, g_fea, means=None, stds=None, testing=True, root_path='./', chunk_size_list=(), determ_codec=False):
+    def compress(self, g_xyz, g_fea, means=None, stds=None, testing=True, root_path='./', chunk_size_list=(), determ_codec=False, *, seed):
         c_size_fea, c_size_feq, c_size_geo = chunk_size_list
         g_xyz, g_fea = sorted_orig_voxels(g_xyz, g_fea)  # to morton order
         # doing compression
@@ -346,7 +346,10 @@ class FCGS(nn.Module):
             gaussian_params=g_xyz,
             bin_path=os.path.join(root_path, 'xyz_gpcc.bin')
         )[-1]['file_size']['total'] * 8 * 1024 * 1024
-        torch.manual_seed(1)
+        # This permutation defines the four autoregressive context groups
+        # (s0..s4 below): it must be reproduced bit-for-bit by decomprss(), so
+        # the same seed has to be used on both sides.
+        torch.manual_seed(seed)
         shuffled_indices = torch.randperm(g_xyz.size(0))
         g_xyz = g_xyz[shuffled_indices]  # [N_g, 3]
         g_fea = g_fea[shuffled_indices]  # [N_g, 56]
@@ -610,13 +613,15 @@ class FCGS(nn.Module):
                 bits_geo/b2M, bits_geo_main/b2M, bits_geo_hyp/b2M,
                 )
 
-    def decomprss(self, means=None, stds=None, root_path='./', chunk_size_list=()):
+    def decomprss(self, means=None, stds=None, root_path='./', chunk_size_list=(), *, seed):
         c_size_fea, c_size_feq, c_size_geo = chunk_size_list
         print('Start decompressing xyz...')
         g_xyz = decompress_gaussian_params(
             bin_path=os.path.join(root_path, 'xyz_gpcc.bin'),
         )[0]  # [N_g, 3]
-        torch.manual_seed(1)
+        # Must match the permutation compress() applied, hence the same seed:
+        # a mismatch silently decodes garbage instead of raising.
+        torch.manual_seed(seed)
         shuffled_indices = torch.randperm(g_xyz.size(0))
         g_xyz = g_xyz[shuffled_indices]  # [N_g, 3]
         norm_xyz, norm_xyz_clamp, mask_xyz = normalize_xyz(g_xyz, K=self.norm_radius, means=means, stds=stds)   # [N_g, 3]
