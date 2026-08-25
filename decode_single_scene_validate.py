@@ -13,6 +13,7 @@ Usage:
         --source_path /path/to/scene/images
 """
 
+import gc
 import json
 import os
 import sys
@@ -90,6 +91,15 @@ def train(args, dataset, pipeline):
     if args.ply_path_to:
         gaussians.save_ply(args.ply_path_to)
         print(f"Decompressed ply file saved to {args.ply_path_to}!")
+
+    # The decode is over, but its working set is still resident: the per-step
+    # tensors duplicate everything torch.cat produced, and the codec network
+    # holds its own weights and entropy tables. Left in place, LPIPS ends up
+    # with no room for a cuDNN workspace and dies with "Unable to find a valid
+    # cuDNN algorithm to run convolution" *after* a perfectly good decode.
+    del g_xyz_list, g_fea_list, g_xyz_out, g_fea_out, CM
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Imported late: constructing the VGG network allocates GPU memory, which
     # must not compete with the decode above.
